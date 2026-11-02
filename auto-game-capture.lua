@@ -2,10 +2,11 @@
 Auto Game Capture
 
 Follows the focused window: when its executable is a known game (custom list or
-JSON database), a Game Capture (or Window Capture, for listed executables) source
-is pointed at that exact window and shown. Otherwise a screen capture source is
-shown. The screen source stays visible until the capture source reports it is
-hooked, so switching never shows an empty frame.
+JSON database), a Game Capture (or Window Capture, for "Window" database entries
+and listed executables) source is pointed at that exact window and shown.
+Otherwise a screen capture source is shown. The screen source stays visible
+until the capture source reports it is hooked, so switching never shows an
+empty frame.
 
 Saved replays are moved into a folder named after the game. It goes inside the
 recording folder, after any fixed leading folders of the filename formatting
@@ -16,7 +17,9 @@ Optionally, every saved replay is also hard linked into a configurable folder
 Apps in "Keep current capture when focused" behave like OBS itself: focusing
 them leaves the current capture (and replay game folder) unchanged.
 
-Database format: { "<lowercase exe name without .exe>": "<display name>", ... }
+Database format:
+  { "<lowercase exe name without .exe>": { "name": "<display name>", "capture": "Game" | "Window" }, ... }
+"capture" picks the default capture source; "Use Window Capture for" overrides it.
 If no database is set, games_database.json next to this script is used.
 Custom games: "<exe> = <display name>" entries in the script settings.
 ]]
@@ -195,16 +198,20 @@ local function load_db(path)
 	end
 end
 
-local function db_title(key)
-	if db ~= nil and obs.obs_data_has_user_value(db, key) then
-		local title = obs.obs_data_get_string(db, key)
-		return title ~= "" and title or key
+-- Returns the display name and default capture kind ("game" or "window") of a
+-- database entry, or nil when the exe isn't listed.
+local function db_entry(key)
+	if db == nil then
+		return nil
 	end
-	return nil
-end
-
-local function game_name(key)
-	return cfg.custom_games[key] or db_title(key)
+	local entry = obs.obs_data_get_obj(db, key)
+	if entry == nil then
+		return nil
+	end
+	local title = obs.obs_data_get_string(entry, "name")
+	local capture = obs.obs_data_get_string(entry, "capture"):lower()
+	obs.obs_data_release(entry)
+	return title ~= "" and title or key, capture == "window" and "window" or "game"
 end
 
 local function each_list_value(settings, name, fn)
@@ -380,14 +387,15 @@ local function on_focus(hwnd, key)
 	if cfg.held[name] then
 		return
 	end
-	local game = game_name(name)
+	local title, capture = db_entry(name)
+	local game = cfg.custom_games[name] or title
 	local kind = "screen"
 	if not cfg.excluded[name] then
 		if cfg.window_exes[name] then
 			kind = "window"
 			game = game or name
 		elseif game ~= nil then
-			kind = "game"
+			kind = capture or "game"
 		end
 	end
 
@@ -647,7 +655,8 @@ end
 function script_description()
 	return [[<b>Auto Game Capture</b><br>
 Shows a Game Capture source pointed at the focused game, a Window Capture source for
-listed executables, and a screen source for everything else.<br><br>
+games marked <code>"capture": "Window"</code> in the database or listed under "Use Window
+Capture for", and a screen source for everything else.<br><br>
 Put all three sources in one scene. The script controls their visibility and
 rewrites the capture sources' window settings. Games are matched by executable name
 against the custom games list, then the JSON database.<br><br>
