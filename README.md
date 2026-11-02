@@ -66,6 +66,30 @@ Each entry maps a lowercase executable name, without `.exe`, to a display name a
 
 `capture` is `Game` or `Window`.
 
+## Contributing
+
+If you have a game that isn't detected, or one that only works with another capture type.. please open a PR or an issue with the custom game entry you've found works for it so it works for others too!!
+
+As an example, this is the custom game entry for Onimusha: Way of the Sword:
+
+```
+OnimushaWotS.exe = Onimusha: Way of the Sword = Game
+```
+
+**For a PR**, turn it into a line in `games_database.json` (lowercase exe, no `.exe`, alphabetical order please):
+
+```json
+"onimushawots": {"name": "Onimusha: Way of the Sword", "capture": "Game"}
+```
+
+**For an issue**, just paste the custom game entry, or list:
+
+- the game's exe (e.g. `OnimushaWotS.exe`)
+- the game's name
+- the capture type that works (`Game` or `Window`)
+
+Thank you!
+
 ## Notes
 
 - Hard links take no extra disk space. To delete a hard linked replay, delete it from both the hard link folder and the sorted folder.
