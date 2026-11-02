@@ -20,7 +20,10 @@ them leaves the current capture (and replay game folder) unchanged.
 Database format:
   { "<lowercase exe name without .exe>": { "name": "<display name>", "capture": "Game" | "Window" }, ... }
 "capture" picks the default capture source; "Use Window Capture for" overrides it.
-If no database is set, games_database.json next to this script is used.
+If no database is set, games_database.json next to this script is used. That
+file is downloaded if missing and kept up to date from the configured URL
+(checked on load and every few hours); a database picked in the settings is
+never touched.
 Custom games: "<exe> = <display name>" entries in the script settings.
 ]]
 
@@ -43,6 +46,30 @@ int MultiByteToWideChar(uint32_t code_page, uint32_t flags, const char *src, int
                         uint16_t *dst, int dst_len);
 int CreateHardLinkW(const uint16_t *new_path, const uint16_t *existing_path, void *security);
 uint32_t GetLastError(void);
+typedef struct {
+	uint32_t cb;
+	uint16_t *lpReserved;
+	uint16_t *lpDesktop;
+	uint16_t *lpTitle;
+	uint32_t dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+	uint16_t wShowWindow;
+	uint16_t cbReserved2;
+	uint8_t *lpReserved2;
+	void *hStdInput;
+	void *hStdOutput;
+	void *hStdError;
+} STARTUPINFOW;
+typedef struct {
+	void *hProcess;
+	void *hThread;
+	uint32_t dwProcessId;
+	uint32_t dwThreadId;
+} PROCESS_INFORMATION;
+int CreateProcessW(const uint16_t *app, uint16_t *cmdline, void *process_attrs, void *thread_attrs,
+                   int inherit, uint32_t flags, void *env, const uint16_t *cwd,
+                   STARTUPINFOW *startup, PROCESS_INFORMATION *info);
+uint32_t WaitForSingleObject(void *handle, uint32_t ms);
+int GetExitCodeProcess(void *process, uint32_t *code);
 ]])
 
 local user32 = ffi.load("user32")
@@ -55,6 +82,10 @@ local WINDOW_PRIORITY_EXE = 2
 local MKDIR_ERROR = -1
 local MOVE_RETRY_MS = 500
 local MOVE_MAX_TRIES = 20
+local CREATE_NO_WINDOW = 0x08000000
+local DB_UPDATE_HOURS = 6
+local DB_DOWNLOAD_POLL_MS = 500
+local DEFAULT_DB_URL = "https://raw.githubusercontent.com/Kinatera/OBS-autoreplay/main/games_database.json"
 
 -- Transient shell windows that appear while switching focus; keep the current
 -- capture instead of flashing to the screen source.
@@ -76,6 +107,8 @@ local own_pid = kernel32.GetCurrentProcessId()
 local cfg = {
 	enabled = true,
 	db_path = "",
+	db_auto_update = true,
+	db_url = DEFAULT_DB_URL,
 	scene = "",
 	sources = { game = "", window = "", screen = "" },
 	window_exes = {},
@@ -89,6 +122,8 @@ local cfg = {
 }
 
 local db = nil -- obs_data_t loaded from cfg.db_path
+local db_download = nil -- running curl download: { process, tmp, path, url }
+local db_checked_url = nil -- URL already checked this session
 local warned = {}
 
 local state = {
@@ -170,16 +205,8 @@ end
 local DEFAULT_DB_NAME = "games_database.json"
 
 -- An empty setting means games_database.json next to this script.
-local function resolve_db_path(setting)
-	if setting ~= "" then
-		return setting
-	end
-	local path = script_path() .. DEFAULT_DB_NAME
-	if obs.os_file_exists(path) then
-		return path
-	end
-	warn_once("no-default-db", "No game database set and " .. DEFAULT_DB_NAME .. " not found next to the script")
-	return ""
+local function default_db_path()
+	return script_path() .. DEFAULT_DB_NAME
 end
 
 local function load_db(path)
@@ -188,6 +215,10 @@ local function load_db(path)
 		db = nil
 	end
 	if path == "" then
+		return
+	end
+	if not obs.os_file_exists(path) then
+		obs.script_log(obs.LOG_WARNING, "Game database not found: " .. path)
 		return
 	end
 	db = obs.obs_data_create_from_json_file(path)
@@ -650,6 +681,96 @@ local function on_frontend_event(event)
 	end
 end
 
+-- Database updates ---------------------------------------------------------------
+
+-- Normalized JSON of a database file, or nil when it can't be parsed.
+local function db_json(path)
+	local data = obs.obs_data_create_from_json_file(path)
+	if data == nil then
+		return nil
+	end
+	local json = obs.obs_data_get_json(data)
+	obs.obs_data_release(data)
+	return json
+end
+
+local function install_db(download)
+	local new = db_json(download.tmp)
+	if new == nil or not new:match('^%s*{%s*"[^"]*"%s*:%s*{') then
+		obs.script_log(obs.LOG_WARNING, "Downloaded game database is not valid, keeping the current one")
+		obs.os_unlink(download.tmp)
+		return
+	end
+	local exists = obs.os_file_exists(download.path)
+	if exists and db_json(download.path) == new then
+		obs.os_unlink(download.tmp)
+		return -- already up to date
+	end
+	local result
+	if exists then
+		result = obs.os_safe_replace(download.path, download.tmp, nil)
+	else
+		result = obs.os_rename(download.tmp, download.path)
+	end
+	if result ~= 0 then
+		obs.script_log(obs.LOG_WARNING, "Could not write game database " .. download.path)
+		obs.os_unlink(download.tmp)
+		return
+	end
+	log((exists and "Updated" or "Downloaded") .. " game database from " .. download.url)
+	if cfg.db_path == download.path then
+		load_db(download.path)
+	end
+end
+
+local function poll_db_download()
+	local download = db_download
+	if download == nil then
+		obs.timer_remove(poll_db_download)
+		return
+	end
+	if kernel32.WaitForSingleObject(download.process, 0) ~= 0 then
+		return -- still running
+	end
+	obs.timer_remove(poll_db_download)
+	db_download = nil
+	local code = ffi.new("uint32_t[1]")
+	local ok = kernel32.GetExitCodeProcess(download.process, code) ~= 0 and code[0] == 0
+	kernel32.CloseHandle(download.process)
+	if ok then
+		install_db(download)
+	else
+		obs.script_log(obs.LOG_WARNING, string.format(
+			"Could not download game database from %s (curl exit code %d)", download.url, tonumber(code[0])))
+		obs.os_unlink(download.tmp)
+	end
+end
+
+-- Downloads the database next to the script in the background with Windows'
+-- curl.exe; poll_db_download installs it once curl exits.
+local function check_db_update()
+	if db_download ~= nil then
+		return
+	end
+	local path = default_db_path()
+	local tmp = path .. ".download"
+	obs.os_unlink(tmp)
+	local curl = (os.getenv("SystemRoot") or "C:\\Windows") .. "\\System32\\curl.exe"
+	local url = cfg.db_url:gsub('"', "")
+	local cmd = string.format('"%s" -fsSL --max-time 60 -o "%s" "%s"', curl, (tmp:gsub("/", "\\")), url)
+	local startup = ffi.new("STARTUPINFOW")
+	startup.cb = ffi.sizeof(startup)
+	local info = ffi.new("PROCESS_INFORMATION")
+	if kernel32.CreateProcessW(nil, utf8_to_wide(cmd), nil, nil, 0, CREATE_NO_WINDOW, nil, nil, startup, info) == 0 then
+		warn_once("curl", string.format("Could not start %s to update the game database (error %d)",
+			curl, tonumber(kernel32.GetLastError())))
+		return
+	end
+	kernel32.CloseHandle(info.hThread)
+	db_download = { process = info.hProcess, tmp = tmp, path = path, url = url }
+	obs.timer_add(poll_db_download, DB_DOWNLOAD_POLL_MS)
+end
+
 -- OBS script interface ------------------------------------------------------------
 
 function script_description()
@@ -688,6 +809,10 @@ function script_properties()
 	obs.obs_properties_add_bool(props, "enabled", "Enabled")
 	local p = obs.obs_properties_add_path(props, "db_path", "Game database", obs.OBS_PATH_FILE, "JSON files (*.json)", nil)
 	obs.obs_property_set_long_description(p, "Leave empty to use " .. DEFAULT_DB_NAME .. " in the script's folder.")
+	p = obs.obs_properties_add_bool(props, "db_auto_update", "Download and update the database automatically")
+	obs.obs_property_set_long_description(p, "Only applies when no database file is picked above. Checks on load and every "
+		.. DB_UPDATE_HOURS .. " hours, and replaces " .. DEFAULT_DB_NAME .. " in the script's folder when it changed.")
+	obs.obs_properties_add_text(props, "db_url", "Database update URL", obs.OBS_TEXT_DEFAULT)
 
 	p = obs.obs_properties_add_list(props, "scene", "Scene", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
 	obs.obs_property_list_add_string(p, "(none)", "")
@@ -718,6 +843,8 @@ end
 
 function script_defaults(settings)
 	obs.obs_data_set_default_bool(settings, "enabled", true)
+	obs.obs_data_set_default_bool(settings, "db_auto_update", true)
+	obs.obs_data_set_default_string(settings, "db_url", DEFAULT_DB_URL)
 	obs.obs_data_set_default_bool(settings, "sort_replays", true)
 	obs.obs_data_set_default_int(settings, "interval", 250)
 end
@@ -729,10 +856,22 @@ end
 function script_update(settings)
 	obs.timer_remove(poll)
 
-	local db_path = resolve_db_path(obs.obs_data_get_string(settings, "db_path"))
+	local db_setting = obs.obs_data_get_string(settings, "db_path")
+	cfg.db_auto_update = obs.obs_data_get_bool(settings, "db_auto_update")
+	cfg.db_url = obs.obs_data_get_string(settings, "db_url"):match("^%s*(.-)%s*$")
+	local db_path = db_setting ~= "" and db_setting or default_db_path()
 	if db_path ~= cfg.db_path then
 		cfg.db_path = db_path
 		load_db(db_path)
+	end
+
+	obs.timer_remove(check_db_update)
+	if db_setting == "" and cfg.db_auto_update and cfg.db_url ~= "" then
+		obs.timer_add(check_db_update, DB_UPDATE_HOURS * 60 * 60 * 1000)
+		if db_checked_url ~= cfg.db_url then
+			db_checked_url = cfg.db_url
+			check_db_update()
+		end
 	end
 
 	cfg.enabled = obs.obs_data_get_bool(settings, "enabled")
@@ -768,6 +907,12 @@ end
 function script_unload()
 	obs.timer_remove(poll)
 	obs.timer_remove(retry_moves)
+	obs.timer_remove(check_db_update)
+	obs.timer_remove(poll_db_download)
+	if db_download ~= nil then
+		kernel32.CloseHandle(db_download.process)
+		db_download = nil
+	end
 	obs.obs_frontend_remove_event_callback(on_frontend_event)
 	if db ~= nil then
 		obs.obs_data_release(db)
