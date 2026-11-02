@@ -94,10 +94,9 @@ local cfg = {
 	db_url = DEFAULT_DB_URL,
 	scene = "",
 	sources = { game = "", window = "", screen = "" },
-	window_exes = {},
 	excluded = {},
 	held = {}, -- exes that keep the current capture when focused, like OBS itself
-	custom_games = {}, -- normalized exe -> display name; overrides the database
+	custom_games = {}, -- normalized exe -> { name, capture }; overrides the database
 	sort_replays = true,
 	link_replays = false,
 	link_dir = "",
@@ -252,16 +251,26 @@ local function read_exe_set(settings, name)
 	return set
 end
 
--- Entries look like "game.exe = Display Name"; the name defaults to the exe.
+-- Entries look like "game.exe = Display Name = Game|Window". The name and the
+-- capture type are optional and fall back to the database, then the exe name
+-- and Game Capture.
 local function read_custom_games(settings)
 	local games = {}
 	each_list_value(settings, "custom_games", function(value)
-		local exe, title = value:match("^(.-)=(.*)$")
+		local exe, rest = value:match("^(.-)=(.*)$")
 		local key = normalize_exe(exe or value)
-		title = (title or ""):match("^%s*(.-)%s*$")
-		if key ~= "" then
-			games[key] = title ~= "" and title or key
+		if key == "" then
+			return
 		end
+		local title, capture = (rest or ""):match("^(.*)=(.-)$")
+		title = (title or rest or ""):match("^%s*(.-)%s*$")
+		capture = (capture or ""):match("^%s*(.-)%s*$"):lower()
+		if capture ~= "" and capture ~= "game" and capture ~= "window" then
+			obs.script_log(obs.LOG_WARNING, string.format(
+				"Custom game %q: capture type must be Game or Window, ignoring %q", value, capture))
+			capture = ""
+		end
+		games[key] = { name = title ~= "" and title or nil, capture = capture ~= "" and capture or nil }
 	end)
 	return games
 end
@@ -402,15 +411,15 @@ local function on_focus(hwnd, key)
 		return
 	end
 	local title, capture = db_entry(name)
-	local game = cfg.custom_games[name] or title
+	local custom = cfg.custom_games[name]
+	local game = title
+	if custom ~= nil then
+		game = custom.name or title or name
+		capture = custom.capture or capture
+	end
 	local kind = "screen"
-	if not cfg.excluded[name] then
-		if cfg.window_exes[name] then
-			kind = "window"
-			game = game or name
-		elseif game ~= nil then
-			kind = capture or "game"
-		end
+	if game ~= nil and not cfg.excluded[name] then
+		kind = capture or "game"
 	end
 
 	local label = string.format("%s (%s)", game or name, exe)
@@ -818,9 +827,7 @@ function script_properties()
 	add_source_list(props, "window_source", "Window Capture source", "window_capture")
 	add_source_list(props, "screen_source", "Screen source", "monitor_capture")
 
-	obs.obs_properties_add_editable_list(props, "custom_games", "Custom games (exe = name)",
-		obs.OBS_EDITABLE_LIST_TYPE_STRINGS, nil, nil)
-	obs.obs_properties_add_editable_list(props, "window_exes", "Use Window Capture for",
+	obs.obs_properties_add_editable_list(props, "custom_games", "Custom games (exe = name = Game/Window)",
 		obs.OBS_EDITABLE_LIST_TYPE_STRINGS, nil, nil)
 	obs.obs_properties_add_editable_list(props, "excluded_exes", "Never treat as a game",
 		obs.OBS_EDITABLE_LIST_TYPE_STRINGS, nil, nil)
@@ -876,7 +883,6 @@ function script_update(settings)
 	cfg.sources.game = obs.obs_data_get_string(settings, "game_source")
 	cfg.sources.window = obs.obs_data_get_string(settings, "window_source")
 	cfg.sources.screen = obs.obs_data_get_string(settings, "screen_source")
-	cfg.window_exes = read_exe_set(settings, "window_exes")
 	cfg.excluded = read_exe_set(settings, "excluded_exes")
 	cfg.held = read_exe_set(settings, "held_exes")
 	cfg.custom_games = read_custom_games(settings)
