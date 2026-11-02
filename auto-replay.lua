@@ -78,6 +78,30 @@ local HOLD_CLASSES = {
 	ForegroundStaging = true, -- shown briefly during focus changes
 }
 
+-- Explorer windows that keep the current capture. Only these: the desktop and
+-- folder windows still switch to the screen source.
+local EXPLORER_HOLD_CLASSES = {
+	["#32770"] = true, -- Run dialog
+	Shell_TrayWnd = true, -- taskbar
+	Shell_SecondaryTrayWnd = true, -- taskbar on other monitors
+}
+
+-- Default "Keep current capture when focused" entries: Windows shell UI that
+-- takes focus briefly.
+local DEFAULT_HELD_EXES = {
+	"SearchHost.exe", -- Start/search (Windows 11)
+	"SearchApp.exe", -- search (Windows 10)
+	"StartMenuExperienceHost.exe",
+	"ShellExperienceHost.exe", -- notification center and flyouts
+	"ShellHost.exe", -- quick settings
+	"TextInputHost.exe", -- emoji panel, clipboard history, touch keyboard
+	"ScreenClippingHost.exe",
+	"SnippingTool.exe",
+	"GameBar.exe",
+	"LockApp.exe",
+	"CredentialUIBroker.exe",
+}
+
 local MODE_LABELS = { game = "Game Capture", window = "Window Capture", screen = "Screen" }
 
 local WIDE_BUF_LEN = 32768
@@ -407,7 +431,7 @@ local function on_focus(hwnd, key)
 	end
 
 	local name = normalize_exe(exe)
-	if cfg.held[name] then
+	if cfg.held[name] or (name == "explorer" and EXPLORER_HOLD_CLASSES[class]) then
 		return
 	end
 	local title, capture = db_entry(name)
@@ -852,6 +876,15 @@ function script_defaults(settings)
 	obs.obs_data_set_default_string(settings, "db_url", DEFAULT_DB_URL)
 	obs.obs_data_set_default_bool(settings, "sort_replays", true)
 	obs.obs_data_set_default_int(settings, "interval", 250)
+	local held = obs.obs_data_array_create()
+	for _, exe in ipairs(DEFAULT_HELD_EXES) do
+		local item = obs.obs_data_create()
+		obs.obs_data_set_string(item, "value", exe)
+		obs.obs_data_array_push_back(held, item)
+		obs.obs_data_release(item)
+	end
+	obs.obs_data_set_default_array(settings, "held_exes", held)
+	obs.obs_data_array_release(held)
 end
 
 function script_load(settings)

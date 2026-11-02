@@ -39,7 +39,7 @@ An OBS script that detects the game you're playing and sorts Replay Buffer clips
 | Auto-update database | Checks for a newer database on load and every 6 hours. Only applies to the default database. |
 | Custom games | Adds games, or overrides database entries. See [Custom games](#custom-games). |
 | Never treat as a game | Ignores these executables even if they're in the database, so they always show the screen. Useful for apps the database lists that aren't games (e.g. After Effects). |
-| Keep current capture when focused | Apps that don't switch away from the game, like OBS itself. |
+| Keep current capture when focused | Apps that don't switch away from the game, like OBS itself. Comes pre-filled with Windows shell UI (Start, search, notification center, emoji panel, Snipping Tool, Game Bar, ...). The Run dialog and taskbar are always kept. |
 | Move saved replays into game folders | Sorts saved replays by game. |
 | Also hard link saved replays into folder | Links each saved replay into the chosen folder. Must be on the same drive. |
 
