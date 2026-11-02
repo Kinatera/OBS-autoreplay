@@ -1,30 +1,12 @@
 --[[
-Auto Game Capture
+AutoReplay
 
-Follows the focused window: when its executable is a known game (custom list or
-JSON database), a Game Capture (or Window Capture, for "Window" database entries
-and listed executables) source is pointed at that exact window and shown.
-Otherwise a screen capture source is shown. The screen source stays visible
-until the capture source reports it is hooked, so switching never shows an
-empty frame.
+Switches between Game, Window and Screen capture to follow the focused game, and
+sorts saved replays into per-game folders.
 
-Saved replays are moved into a folder named after the game. It goes inside the
-recording folder, after any fixed leading folders of the filename formatting
-(e.g. "/OBS/%CCYY %B%DD" -> <recording folder>/OBS/<game>/2026 November01), and
-the rest of the replay buffer's formatting is kept below it.
-Optionally, every saved replay is also hard linked into a configurable folder
-(same drive only), e.g. a folder another app imports from. No extra disk space.
-Apps in "Keep current capture when focused" behave like OBS itself: focusing
-them leaves the current capture (and replay game folder) unchanged.
-
-Database format:
-  { "<lowercase exe name without .exe>": { "name": "<display name>", "capture": "Game" | "Window" }, ... }
-"capture" picks the default capture source; "Use Window Capture for" overrides it.
-If no database is set, games_database.json next to this script is used. That
-file is downloaded if missing and kept up to date from the configured URL
-(checked on load and every few hours); a database picked in the settings is
-never touched.
-Custom games: "<exe> = <display name>" entries in the script settings.
+Database: { "<exe without .exe>": { "name": "<name>", "capture": "Game" | "Window" } }
+Defaults to games_database.json next to this script, downloaded and kept up to date
+from the update URL.
 ]]
 
 local obs = obslua
@@ -106,6 +88,7 @@ local own_pid = kernel32.GetCurrentProcessId()
 
 local cfg = {
 	enabled = true,
+	only_with_replay_buffer = false,
 	db_path = "",
 	db_auto_update = true,
 	db_url = DEFAULT_DB_URL,
@@ -675,9 +658,29 @@ local function on_replay_saved()
 	end
 end
 
+local polling = false
+
+-- Polls focus while enabled, and only while the replay buffer runs when
+-- "only_with_replay_buffer" is set.
+local function update_polling()
+	obs.timer_remove(poll)
+	local active = cfg.enabled and (not cfg.only_with_replay_buffer or obs.obs_frontend_replay_buffer_active())
+	if active then
+		state.last_hwnd = nil -- re-check the focused window right away
+		obs.timer_add(poll, cfg.interval)
+	end
+	if cfg.enabled and cfg.only_with_replay_buffer and active ~= polling then
+		log(active and "Replay buffer started: following focus" or "Replay buffer stopped: paused")
+	end
+	polling = active
+end
+
 local function on_frontend_event(event)
 	if event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVED then
 		on_replay_saved()
+	elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED
+		or event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED then
+		update_polling()
 	end
 end
 
@@ -774,18 +777,9 @@ end
 -- OBS script interface ------------------------------------------------------------
 
 function script_description()
-	return [[<b>Auto Game Capture</b><br>
-Shows a Game Capture source pointed at the focused game, a Window Capture source for
-games marked <code>"capture": "Window"</code> in the database or listed under "Use Window
-Capture for", and a screen source for everything else.<br><br>
-Put all three sources in one scene. The script controls their visibility and
-rewrites the capture sources' window settings. Games are matched by executable name
-against the custom games list, then the JSON database.<br><br>
-Custom games use <code>game.exe = Display Name</code> (the name is optional).
-Saved replays are moved into a folder named after the game, placed after any fixed
-leading folders of the filename formatting (e.g. <code>OBS/&lt;game&gt;/...</code>).<br><br>
-Apps under "Keep current capture when focused" behave like OBS itself: focusing them
-doesn't switch away from the game.]]
+	return [[<b>AutoReplay</b><br>
+Follows the focused game with Game, Window or Screen capture, and sorts saved
+replays into per-game folders. Put all three sources in one scene.]]
 end
 
 local function add_source_list(props, setting, label, source_id)
@@ -807,11 +801,11 @@ function script_properties()
 	local props = obs.obs_properties_create()
 
 	obs.obs_properties_add_bool(props, "enabled", "Enabled")
+	obs.obs_properties_add_bool(props, "only_with_replay_buffer", "Only while the replay buffer is running")
 	local p = obs.obs_properties_add_path(props, "db_path", "Game database", obs.OBS_PATH_FILE, "JSON files (*.json)", nil)
-	obs.obs_property_set_long_description(p, "Leave empty to use " .. DEFAULT_DB_NAME .. " in the script's folder.")
-	p = obs.obs_properties_add_bool(props, "db_auto_update", "Download and update the database automatically")
-	obs.obs_property_set_long_description(p, "Only applies when no database file is picked above. Checks on load and every "
-		.. DB_UPDATE_HOURS .. " hours, and replaces " .. DEFAULT_DB_NAME .. " in the script's folder when it changed.")
+	obs.obs_property_set_long_description(p, "Empty: " .. DEFAULT_DB_NAME .. " next to the script.")
+	p = obs.obs_properties_add_bool(props, "db_auto_update", "Auto-update database")
+	obs.obs_property_set_long_description(p, "Only for the default database. Checks every " .. DB_UPDATE_HOURS .. " hours.")
 	obs.obs_properties_add_text(props, "db_url", "Database update URL", obs.OBS_TEXT_DEFAULT)
 
 	p = obs.obs_properties_add_list(props, "scene", "Scene", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
@@ -834,10 +828,14 @@ function script_properties()
 		obs.OBS_EDITABLE_LIST_TYPE_STRINGS, nil, nil)
 
 	obs.obs_properties_add_bool(props, "sort_replays", "Move saved replays into game folders")
-	obs.obs_properties_add_bool(props, "link_replays", "Also hard link saved replays into folder")
+	obs.obs_properties_add_bool(props, "link_replays", "Also hard link saved replays into folder*")
 	obs.obs_properties_add_path(props, "link_dir", "Hard link folder", obs.OBS_PATH_DIRECTORY, nil, nil)
 
 	obs.obs_properties_add_int(props, "interval", "Focus check interval (ms)", 50, 2000, 50)
+
+	obs.obs_properties_add_text(props, "link_note",
+		"* To delete a hard linked replay, delete it from both the hard link folder and the sorted folder.",
+		obs.OBS_TEXT_INFO)
 	return props
 end
 
@@ -854,8 +852,6 @@ function script_load(settings)
 end
 
 function script_update(settings)
-	obs.timer_remove(poll)
-
 	local db_setting = obs.obs_data_get_string(settings, "db_path")
 	cfg.db_auto_update = obs.obs_data_get_bool(settings, "db_auto_update")
 	cfg.db_url = obs.obs_data_get_string(settings, "db_url"):match("^%s*(.-)%s*$")
@@ -875,6 +871,7 @@ function script_update(settings)
 	end
 
 	cfg.enabled = obs.obs_data_get_bool(settings, "enabled")
+	cfg.only_with_replay_buffer = obs.obs_data_get_bool(settings, "only_with_replay_buffer")
 	cfg.scene = obs.obs_data_get_string(settings, "scene")
 	cfg.sources.game = obs.obs_data_get_string(settings, "game_source")
 	cfg.sources.window = obs.obs_data_get_string(settings, "window_source")
@@ -899,9 +896,7 @@ function script_update(settings)
 	state.target = {}
 	state.winstr = {}
 
-	if cfg.enabled then
-		obs.timer_add(poll, cfg.interval)
-	end
+	update_polling()
 end
 
 function script_unload()
