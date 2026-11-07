@@ -1804,6 +1804,7 @@
     "war": {"name": "Warhammer Online", "capture": "Game"},
     "war-win64-shipping": {"name": "Foxhole", "capture": "Game"},
     "war3": {"name": "Warcraft III", "capture": "Game"},
+    "wardogsclient-win64-shipping": {"name": "WARDOGS", "capture": "Game"},
     "warcraft ii bne": {"name": "Warcraft 2", "capture": "Game"},
     "warcraft iii": {"name": "Warcraft III", "capture": "Game"},
     "warframe.x64": {"name": "Warframe", "capture": "Game"},
