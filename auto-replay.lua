@@ -1115,12 +1115,16 @@ local function on_replay_saved()
 end
 
 local polling = false
+-- OBS loads scripts before the scene collection's sources, so the scene and
+-- sources only exist once the collection has finished loading.
+local collection_loaded = false
 
--- Polls focus while enabled, and only while the replay buffer runs when
--- "only_with_replay_buffer" is set.
+-- Polls focus while enabled and the scene collection is loaded, and only while
+-- the replay buffer runs when "only_with_replay_buffer" is set.
 local function update_polling()
 	obs.timer_remove(poll)
-	local active = cfg.enabled and (not cfg.only_with_replay_buffer or obs.obs_frontend_replay_buffer_active())
+	local active = collection_loaded and cfg.enabled
+		and (not cfg.only_with_replay_buffer or obs.obs_frontend_replay_buffer_active())
 	if active then
 		state.last_hwnd = nil -- re-check the focused window right away
 		obs.timer_add(poll, cfg.interval)
@@ -1136,6 +1140,10 @@ local function on_frontend_event(event)
 		on_replay_saved()
 	elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED
 		or event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED then
+		update_polling()
+	elseif event == obs.OBS_FRONTEND_EVENT_FINISHED_LOADING
+		or event == obs.OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED then
+		collection_loaded = true
 		update_polling()
 	end
 end
@@ -1309,6 +1317,11 @@ end
 function script_load(settings)
 	obs.obs_frontend_add_event_callback(on_frontend_event)
 	steam_types = obs.obs_data_create_from_json_file_safe(steam_types_path(), ".bak") or obs.obs_data_create()
+	-- Added while OBS is running: the collection is already loaded. While OBS
+	-- loads a collection there's no current scene until its sources are loaded.
+	local scene = obs.obs_frontend_get_current_scene()
+	collection_loaded = scene ~= nil
+	obs.obs_source_release(scene)
 end
 
 function script_update(settings)
