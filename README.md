@@ -10,7 +10,8 @@ An OBS script that detects the game you're playing and sorts Replay Buffer clips
 ## Features
 
 - Follows the focused window: games use Game Capture or Window Capture, everything else falls back to screen capture.
-- Matches games by executable name against a database of about 1900 games, plus your own custom entries.
+- Matches games by executable name against a database of about 11,000 games, plus your own custom entries.
+- Also detects Steam and Epic Games Store games from where they're installed, and Minecraft, with Prism Launcher and MultiMC instances named separately (e.g. `Minecraft (Fabulously Optimized)`).
 - Moves saved replays into a folder named after the game, keeping your filename formatting.
 - Optionally hard links every saved replay into a second folder, e.g. Medal.
 - Downloads and keeps the game database up to date automatically.
@@ -38,8 +39,8 @@ An OBS script that detects the game you're playing and sorts Replay Buffer clips
 | Game database | Leave empty to use `games_database.json` next to the script. |
 | Auto-update database | Checks for a newer database on load and every 6 hours. Only applies to the default database. |
 | Custom games | Adds games, or overrides database entries. See [Custom games](#custom-games). |
-| Never treat as a game | Ignores these executables even if they're in the database, so they always show the screen. Useful for apps the database lists that aren't games (e.g. After Effects). |
-| Keep current capture when focused | Apps that don't switch away from the game, like OBS itself. Comes pre-filled with Windows shell UI (Start, search, notification center, emoji panel, Snipping Tool, Game Bar, ...). The Run dialog and taskbar are always kept. |
+| Never treat as a game | Ignores these executables even if they're detected as games, so they always show the screen. Useful for apps the database lists that aren't games (e.g. After Effects). |
+| Keep current capture when focused | Apps that don't switch away from the game, like OBS itself. Comes pre-filled with Windows shell UI (Start, search, notification center, emoji panel, Snipping Tool, Game Bar, ...) and `windhawk-mod.exe`. The Run dialog and taskbar are always kept. |
 | Move saved replays into game folders | Sorts saved replays by game. |
 | Also hard link saved replays into folder | Links each saved replay into the chosen folder. Must be on the same drive. |
 
@@ -65,6 +66,22 @@ Each entry maps a lowercase executable name, without `.exe`, to a display name a
 ```
 
 `capture` is `Game` or `Window`.
+
+When several games share an exe name (`hl2.exe`, `game.exe`, `nw.exe`, ...), the key also includes the folders the exe is in, up to five, separated by `/`. The most specific match wins:
+
+```json
+"garrysmod/hl2": {"name": "Garry's Mod", "capture": "Game"}
+```
+
+## Detection outside the database
+
+Games the database doesn't list are still detected:
+
+- **Steam:** exes under `steamapps\common\<game>\` take the game's name from its Steam manifest. The script asks the Steam store once per game whether it's a game or software (like Wallpaper Engine), and caches the answer in `steam_app_types.json` next to the script.
+- **Epic Games Store:** exes inside an Epic game's install folder take its name from the Epic launcher's install manifests. Unreal Engine and other non-game installs are skipped.
+- **Minecraft:** `java.exe`/`javaw.exe` counts as Minecraft only when it's actually running Minecraft. Prism Launcher and MultiMC instances get their instance name, e.g. `Minecraft (Fabulously Optimized)`, so each instance gets its own replay folder.
+
+Launchers, config tools, installers and crash reporters inside store game folders are ignored.
 
 ## Contributing
 

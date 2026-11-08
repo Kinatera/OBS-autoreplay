@@ -4,13 +4,18 @@ AutoReplay
 Switches between Game, Window and Screen capture to follow the focused game, and
 sorts saved replays into per-game folders.
 
-Database: { "<exe without .exe>": { "name": "<name>", "capture": "Game" | "Window" } }
-Defaults to games_database.json next to this script, downloaded and kept up to date
-from the update URL.
+Database: { "<key>": { "name": "<name>", "capture": "Game" | "Window" } }
+A key is the exe name without .exe, or "<folder>/<exe>" with up to five parent
+folders for exes several games share (e.g. "garrysmod/hl2"); the most specific
+match wins. Defaults to games_database.json next to this script, downloaded and
+kept up to date from the update URL. Exes the database doesn't know are still
+detected as Minecraft (Prism Launcher/MultiMC instances by name) or as Steam and
+Epic Games Store games from where they're installed.
 ]]
 
 local obs = obslua
 local ffi = require("ffi")
+local bit = require("bit")
 
 pcall(ffi.cdef, [[
 void *GetForegroundWindow(void);
@@ -52,10 +57,32 @@ int CreateProcessW(const uint16_t *app, uint16_t *cmdline, void *process_attrs, 
                    STARTUPINFOW *startup, PROCESS_INFORMATION *info);
 uint32_t WaitForSingleObject(void *handle, uint32_t ms);
 int GetExitCodeProcess(void *process, uint32_t *code);
+typedef struct {
+	uint16_t Length;
+	uint16_t MaximumLength;
+	uint16_t *Buffer;
+} UNICODE_STRING;
+int32_t NtQueryInformationProcess(void *process, int info_class, void *info, uint32_t len, uint32_t *ret_len);
+uint32_t GetLongPathNameW(const uint16_t *short_path, uint16_t *long_path, uint32_t len);
+void *CreateFileW(const uint16_t *name, uint32_t access, uint32_t share, void *security, uint32_t disposition,
+                  uint32_t flags, void *template_file);
+int GetFileSizeEx(void *file, int64_t *size);
+int ReadFile(void *file, void *buf, uint32_t to_read, uint32_t *read, void *overlapped);
+typedef struct {
+	uint32_t dwFileAttributes;
+	uint32_t ftCreationTime[2], ftLastAccessTime[2], ftLastWriteTime[2];
+	uint32_t nFileSizeHigh, nFileSizeLow, dwReserved0, dwReserved1;
+	uint16_t cFileName[260];
+	uint16_t cAlternateFileName[14];
+} WIN32_FIND_DATAW;
+void *FindFirstFileW(const uint16_t *pattern, WIN32_FIND_DATAW *data);
+int FindNextFileW(void *find, WIN32_FIND_DATAW *data);
+int FindClose(void *find);
 ]])
 
 local user32 = ffi.load("user32")
 local kernel32 = ffi.load("kernel32")
+local ntdll = ffi.load("ntdll")
 
 local CP_UTF8 = 65001
 local PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -65,9 +92,25 @@ local MKDIR_ERROR = -1
 local MOVE_RETRY_MS = 500
 local MOVE_MAX_TRIES = 20
 local CREATE_NO_WINDOW = 0x08000000
+local GENERIC_READ = 0x80000000
+local FILE_SHARE_READ_WRITE = 0x3
+local OPEN_EXISTING = 3
+local FILE_ATTRIBUTE_DIRECTORY = 0x10
+local PROCESS_COMMAND_LINE_INFORMATION = 60
+local STATUS_INFO_LENGTH_MISMATCH = -1073741820 -- 0xC0000004
+local COMMAND_LINE_BUF_LEN = 65536 + 16 -- longest Windows command line plus its UNICODE_STRING header
+local MAX_READ_BYTES = 16 * 1024 * 1024
+local DB_MAX_FOLDER_DEPTH = 5
 local DB_UPDATE_HOURS = 6
 local DB_DOWNLOAD_POLL_MS = 500
 local DEFAULT_DB_URL = "https://raw.githubusercontent.com/Kinatera/OBS-autoreplay/main/games_database.json"
+local CURL_PATH = (os.getenv("SystemRoot") or "C:\\Windows") .. "\\System32\\curl.exe"
+local STEAM_STORE_QUERY_URL = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json="
+local STEAM_TYPES_NAME = "steam_app_types.json" -- cached Steam store app types, next to the script
+local STEAM_QUERY_POLL_MS = 500
+local STEAM_RETRY_SECONDS = 300
+local EPIC_MANIFESTS = (os.getenv("ProgramData") or "C:\\ProgramData") .. "\\Epic\\EpicGamesLauncher\\Data\\Manifests"
+local EPIC_RESCAN_SECONDS = 30
 
 -- Transient shell windows that appear while switching focus; keep the current
 -- capture instead of flashing to the screen source.
@@ -100,6 +143,7 @@ local DEFAULT_HELD_EXES = {
 	"GameBar.exe",
 	"LockApp.exe",
 	"CredentialUIBroker.exe",
+	"windhawk-mod.exe", -- Windhawk mod helper windows
 }
 
 local MODE_LABELS = { game = "Game Capture", window = "Window Capture", screen = "Screen" }
@@ -124,7 +168,7 @@ local cfg = {
 	sort_replays = true,
 	link_replays = false,
 	link_dir = "",
-	interval = 250,
+	interval = 200,
 }
 
 local db = nil -- obs_data_t loaded from cfg.db_path
@@ -186,8 +230,8 @@ local function window_class(hwnd)
 	return wide_to_utf8(wide_buf, user32.GetClassNameW(hwnd, wide_buf, 256))
 end
 
--- Executable file name (e.g. "Game.exe") of a process, or nil.
-local function process_exe(pid)
+-- Full executable path (e.g. "C:\Games\Game.exe") of a process, or nil.
+local function process_path(pid)
 	local process = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
 	if process == nil then
 		return nil
@@ -198,7 +242,113 @@ local function process_exe(pid)
 	if not ok then
 		return nil
 	end
-	return wide_to_utf8(wide_buf, size_buf[0]):match("[^\\]+$")
+	return wide_to_utf8(wide_buf, size_buf[0])
+end
+
+-- Command line of a process, or nil.
+local function process_command_line(pid)
+	local process = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+	if process == nil then
+		return nil
+	end
+	local len = ffi.new("uint32_t[1]")
+	local buf = ffi.new("uint8_t[?]", COMMAND_LINE_BUF_LEN)
+	local status = ntdll.NtQueryInformationProcess(process, PROCESS_COMMAND_LINE_INFORMATION, buf,
+		COMMAND_LINE_BUF_LEN, len)
+	if status == STATUS_INFO_LENGTH_MISMATCH and len[0] > COMMAND_LINE_BUF_LEN then
+		buf = ffi.new("uint8_t[?]", len[0])
+		status = ntdll.NtQueryInformationProcess(process, PROCESS_COMMAND_LINE_INFORMATION, buf, len[0], len)
+	end
+	kernel32.CloseHandle(process)
+	if status ~= 0 then
+		return nil
+	end
+	local str = ffi.cast("UNICODE_STRING *", buf)
+	return wide_to_utf8(str.Buffer, str.Length / 2)
+end
+
+local function utf8_to_wide(s)
+	local n = kernel32.MultiByteToWideChar(CP_UTF8, 0, s, -1, nil, 0)
+	local buf = ffi.new("uint16_t[?]", math.max(n, 1))
+	kernel32.MultiByteToWideChar(CP_UTF8, 0, s, -1, buf, n)
+	return buf
+end
+
+local function is_invalid_handle(handle)
+	return handle == nil or ffi.cast("intptr_t", handle) == -1
+end
+
+-- Contents of a file, or nil when it can't be read.
+local function read_file(path)
+	local file = kernel32.CreateFileW(utf8_to_wide(path), GENERIC_READ, FILE_SHARE_READ_WRITE, nil, OPEN_EXISTING, 0, nil)
+	if is_invalid_handle(file) then
+		return nil
+	end
+	local data = nil
+	local size = ffi.new("int64_t[1]")
+	if kernel32.GetFileSizeEx(file, size) ~= 0 and size[0] <= MAX_READ_BYTES then
+		local n = tonumber(size[0])
+		local buf = ffi.new("char[?]", math.max(n, 1))
+		local read = ffi.new("uint32_t[1]")
+		if kernel32.ReadFile(file, buf, n, read, nil) ~= 0 then
+			data = ffi.string(buf, read[0])
+		end
+	end
+	kernel32.CloseHandle(file)
+	return data
+end
+
+-- Names of the files (not folders) matching a wildcard like "C:\dir\*.acf".
+local function list_files(pattern)
+	local names = {}
+	local data = ffi.new("WIN32_FIND_DATAW")
+	local find = kernel32.FindFirstFileW(utf8_to_wide(pattern), data)
+	if is_invalid_handle(find) then
+		return names
+	end
+	repeat
+		if bit.band(data.dwFileAttributes, FILE_ATTRIBUTE_DIRECTORY) == 0 then
+			local len = 0
+			while len < 260 and data.cFileName[len] ~= 0 do
+				len = len + 1
+			end
+			names[#names + 1] = wide_to_utf8(data.cFileName, len)
+		end
+	until kernel32.FindNextFileW(find, data) == 0
+	kernel32.FindClose(find)
+	return names
+end
+
+-- Expands 8.3 short names (e.g. "PRISML~1") in an existing path.
+local function long_path(path)
+	local n = kernel32.GetLongPathNameW(utf8_to_wide(path), wide_buf, WIDE_BUF_LEN)
+	if n == 0 or n >= WIDE_BUF_LEN then
+		return path
+	end
+	return wide_to_utf8(wide_buf, n)
+end
+
+-- Starts Windows' curl.exe downloading url to path, without a console window.
+-- Returns the process handle, or nil and the Win32 error code.
+local function start_curl(url, path)
+	local cmd = string.format('"%s" -fsSL --max-time 60 -o "%s" "%s"', CURL_PATH, (path:gsub("/", "\\")),
+		(url:gsub('"', "")))
+	local startup = ffi.new("STARTUPINFOW")
+	startup.cb = ffi.sizeof(startup)
+	local info = ffi.new("PROCESS_INFORMATION")
+	if kernel32.CreateProcessW(nil, utf8_to_wide(cmd), nil, nil, 0, CREATE_NO_WINDOW, nil, nil, startup, info) == 0 then
+		return nil, tonumber(kernel32.GetLastError())
+	end
+	kernel32.CloseHandle(info.hThread)
+	return info.hProcess
+end
+
+-- Exit code of a finished process, closing its handle; 0 means success.
+local function finish_process(process)
+	local code = ffi.new("uint32_t[1]")
+	local ok = kernel32.GetExitCodeProcess(process, code) ~= 0
+	kernel32.CloseHandle(process)
+	return ok and tonumber(code[0]) or -1
 end
 
 -- Database and settings helpers --------------------------------------------------
@@ -251,6 +401,24 @@ local function db_entry(key)
 	return title ~= "" and title or key, capture == "window" and "window" or "game"
 end
 
+-- Database entry for a process path: tries "<folder>/<exe>" keys from the most
+-- specific (DB_MAX_FOLDER_DEPTH parent folders) down to the bare exe name.
+local function db_lookup(path)
+	local parts = {}
+	for part in path:lower():gmatch("[^\\/]+") do
+		parts[#parts + 1] = part
+	end
+	local exe = normalize_exe(parts[#parts] or "")
+	-- parts[1] is the drive, which is never part of a key.
+	for depth = math.min(DB_MAX_FOLDER_DEPTH, #parts - 2), 1, -1 do
+		local title, capture = db_entry(table.concat(parts, "/", #parts - depth, #parts - 1) .. "/" .. exe)
+		if title ~= nil then
+			return title, capture
+		end
+	end
+	return db_entry(exe)
+end
+
 local function each_list_value(settings, name, fn)
 	local arr = obs.obs_data_get_array(settings, name)
 	if arr == nil then
@@ -297,6 +465,273 @@ local function read_custom_games(settings)
 		games[key] = { name = title ~= "" and title or nil, capture = capture ~= "" and capture or nil }
 	end)
 	return games
+end
+
+-- Detection beyond the database ----------------------------------------------------
+
+local JAVA_EXES = { java = true, javaw = true }
+
+-- Instance name of a Minecraft process started by Prism Launcher or MultiMC. Their
+-- command line passes "-Djava.library.path=<instance>\natives"; the instance's
+-- display name is in <instance>\instance.cfg.
+local function multimc_instance_name(cmd)
+	local natives = cmd:match('"%-Djava%.library%.path=([^"]+)"') or cmd:match("%-Djava%.library%.path=(%S+)")
+	if natives == nil then
+		return nil
+	end
+	-- On Windows the launcher passes 8.3 short names for non-ANSI paths.
+	local root = long_path((natives:gsub("[\\/]+$", ""))):match("^(.*)[\\/][^\\/]+$")
+	if root == nil then
+		return nil
+	end
+	local text = read_file(root .. "\\instance.cfg")
+	local name = text and ("\n" .. text):match("\nname=([^\r\n]+)")
+	return name or root:match("[^\\/]+$")
+end
+
+-- Display name of a java process running Minecraft, or nil for other java apps:
+-- "Minecraft (<instance>)" for Prism Launcher/MultiMC instances, else "Minecraft".
+local function minecraft_name(pid)
+	local cmd = process_command_line(pid)
+	if cmd == nil then
+		return nil
+	end
+	if cmd:find("org.prismlauncher.EntryPoint", 1, true) or cmd:find("org.multimc.EntryPoint", 1, true) then
+		local instance = multimc_instance_name(cmd)
+		return instance and ("Minecraft (" .. instance .. ")") or "Minecraft"
+	end
+	if cmd:find("net.minecraft.", 1, true) or cmd:find("-Dminecraft.launcher.brand=", 1, true)
+		or cmd:find("--gameDir", 1, true) then
+		return "Minecraft"
+	end
+	return nil
+end
+
+-- Exes inside store game folders that aren't the game itself.
+local STORE_HELPER_PATTERNS = {
+	"launcher", "config", "setup", "redist", "crash", "unins", "updater", "install", "dedicated", "gameserver",
+	"[_%-%s]server",
+}
+
+local function is_store_helper(name)
+	for _, pattern in ipairs(STORE_HELPER_PATTERNS) do
+		if name:find(pattern) then
+			return true
+		end
+	end
+	return false
+end
+
+-- Steam store item types that count as games: game, demo, mod, DLC, beta, legacy.
+local STEAM_GAME_TYPES = { [0] = true, [1] = true, [2] = true, [4] = true, [12] = true, [14] = true }
+-- Apps the store doesn't list: delisted games, SDK bases running mods, redists.
+-- Counted as games; is_store_helper filters the redist installers.
+local STEAM_NOT_ON_STORE = -1
+local STEAM_NON_GAME_APPS = {
+	[250820] = true, -- SteamVR, listed as a game
+}
+
+local steam_libraries = {} -- steamapps folder (lowercase) -> { installdir (lowercase) -> { appid, name } }
+local steam_types = nil -- obs_data: appid -> Steam store item type, saved to STEAM_TYPES_NAME
+local steam_query = nil -- running curl store lookup: { process, tmp, appid }
+local steam_failed = {} -- appid -> os.time() of its last failed lookup
+
+local function steam_types_path()
+	return script_path() .. STEAM_TYPES_NAME
+end
+
+-- Value of a top-level key in a Steam .acf (VDF) file.
+local function vdf_value(text, key)
+	local value = text:match('"' .. key .. '"%s*"(.-)"%s*\n')
+	return value and (value:gsub("\\(.)", "%1"))
+end
+
+local function scan_steam_library(steamapps)
+	local apps = {}
+	for _, file in ipairs(list_files(steamapps .. "\\appmanifest_*.acf")) do
+		local text = read_file(steamapps .. "\\" .. file)
+		local appid = text and tonumber(vdf_value(text, "appid"))
+		local dir = text and vdf_value(text, "installdir")
+		if appid ~= nil and dir ~= nil and dir ~= "" then
+			local name = vdf_value(text, "name")
+			apps[dir:lower()] = { appid = appid, name = (name ~= nil and name ~= "") and name or dir }
+		end
+	end
+	return apps
+end
+
+-- Steam app ({ appid, name }) whose install folder contains path, or nil.
+local function steam_app(path)
+	local lower = path:lower():gsub("/", "\\")
+	local s, e = lower:find("\\steamapps\\common\\", 1, true)
+	if s == nil then
+		return nil
+	end
+	local steamapps = path:sub(1, s + #"\\steamapps" - 1)
+	local dir = lower:sub(e + 1):match("^[^\\]+")
+	if dir == nil then
+		return nil
+	end
+	local key = steamapps:lower()
+	local apps = steam_libraries[key]
+	if apps == nil or apps[dir] == nil then
+		apps = scan_steam_library(steamapps) -- new install since the last scan
+		steam_libraries[key] = apps
+	end
+	return apps[dir]
+end
+
+-- Store item type from a saved IStoreBrowseService/GetItems response, or nil.
+local function read_steam_type(path)
+	local data = obs.obs_data_create_from_json_file(path)
+	if data == nil then
+		return nil
+	end
+	local store_type = nil
+	local response = obs.obs_data_get_obj(data, "response")
+	if response ~= nil then
+		local items = obs.obs_data_get_array(response, "store_items")
+		if items ~= nil then
+			if obs.obs_data_array_count(items) > 0 then
+				local item = obs.obs_data_array_item(items, 0)
+				if obs.obs_data_get_int(item, "success") == 1 then
+					store_type = obs.obs_data_get_int(item, "type")
+				else
+					store_type = STEAM_NOT_ON_STORE
+				end
+				obs.obs_data_release(item)
+			end
+			obs.obs_data_array_release(items)
+		end
+		obs.obs_data_release(response)
+	end
+	obs.obs_data_release(data)
+	return store_type
+end
+
+local function poll_steam_query()
+	local query = steam_query
+	if query == nil then
+		obs.timer_remove(poll_steam_query)
+		return
+	end
+	if kernel32.WaitForSingleObject(query.process, 0) ~= 0 then
+		return -- still running
+	end
+	obs.timer_remove(poll_steam_query)
+	steam_query = nil
+	local store_type = finish_process(query.process) == 0 and read_steam_type(query.tmp) or nil
+	obs.os_unlink(query.tmp)
+	if store_type == nil then
+		steam_failed[query.appid] = os.time()
+		obs.script_log(obs.LOG_WARNING, string.format("Could not look up Steam app %d on the Steam store", query.appid))
+		return
+	end
+	obs.obs_data_set_int(steam_types, tostring(query.appid), store_type)
+	obs.obs_data_save_json_safe(steam_types, steam_types_path(), ".tmp", ".bak")
+	state.last_hwnd = nil -- re-check the focused window with the answer
+end
+
+-- Looks up an app's type on the Steam store in the background; one at a time,
+-- the focus re-check after it finishes starts the next.
+local function query_steam_type(app)
+	if steam_query ~= nil or os.time() - (steam_failed[app.appid] or -math.huge) < STEAM_RETRY_SECONDS then
+		return
+	end
+	local json = string.format('{"ids":[{"appid":%d}],"context":{"country_code":"US"}}', app.appid)
+	local url = STEAM_STORE_QUERY_URL .. json:gsub("[^%w%-%._~]", function(c)
+		return string.format("%%%02X", c:byte())
+	end)
+	local tmp = (os.getenv("TEMP") or script_path()) .. "\\autoreplay-steam-" .. app.appid .. ".json"
+	obs.os_unlink(tmp)
+	local process, err = start_curl(url, tmp)
+	if process == nil then
+		warn_once("curl-steam", string.format("Could not start %s to look up Steam games (error %d)", CURL_PATH, err))
+		return
+	end
+	log(string.format("Looking up %s on the Steam store", app.name))
+	steam_query = { process = process, tmp = tmp, appid = app.appid }
+	obs.timer_add(poll_steam_query, STEAM_QUERY_POLL_MS)
+end
+
+-- Name of the Steam game installed where path is, or nil (not a Steam game, or
+-- the store lookup is still running).
+local function steam_game(path)
+	local app = steam_app(path)
+	if app == nil or STEAM_NON_GAME_APPS[app.appid] or steam_types == nil then
+		return nil
+	end
+	local key = tostring(app.appid)
+	if not obs.obs_data_has_user_value(steam_types, key) then
+		query_steam_type(app)
+		return nil
+	end
+	local store_type = obs.obs_data_get_int(steam_types, key)
+	if STEAM_GAME_TYPES[store_type] or store_type == STEAM_NOT_ON_STORE then
+		return app.name
+	end
+	return nil
+end
+
+local epic_apps = {} -- { location (lowercase, ends in "\"), name, game }
+local epic_scanned = nil -- os.time() of the last manifest scan
+
+local function scan_epic_manifests()
+	local apps = {}
+	for _, file in ipairs(list_files(EPIC_MANIFESTS .. "\\*.item")) do
+		local data = obs.obs_data_create_from_json_file(EPIC_MANIFESTS .. "\\" .. file)
+		if data ~= nil then
+			local location = obs.obs_data_get_string(data, "InstallLocation"):gsub("/", "\\"):gsub("\\+$", "")
+			local name = obs.obs_data_get_string(data, "DisplayName")
+			-- e.g. "public,games,applications"; Unreal Engine and other tools lack "games".
+			local categories = "," .. obs.obs_data_get_string(data, "TechnicalType") .. ","
+			obs.obs_data_release(data)
+			if location ~= "" and name ~= "" then
+				apps[#apps + 1] = { location = location:lower() .. "\\", name = name,
+					game = categories:find(",games,", 1, true) ~= nil }
+			end
+		end
+	end
+	return apps
+end
+
+-- Name of the Epic Games Store game installed where path is, or nil.
+local function epic_game(path)
+	local lower = path:lower():gsub("/", "\\")
+	local function find()
+		local best = nil
+		for _, app in ipairs(epic_apps) do
+			if lower:sub(1, #app.location) == app.location and (best == nil or #app.location > #best.location) then
+				best = app
+			end
+		end
+		return best
+	end
+	local app = find()
+	if app == nil and (epic_scanned == nil or os.time() - epic_scanned >= EPIC_RESCAN_SECONDS) then
+		epic_apps = scan_epic_manifests()
+		epic_scanned = os.time()
+		app = find()
+	end
+	return app ~= nil and app.game and app.name or nil
+end
+
+-- Display name and capture kind ("game"/"window", nil for the default) of the
+-- game a focused process belongs to, or nil when it isn't one.
+local function identify(pid, path, name)
+	local title, capture = db_lookup(path)
+	if title == nil and JAVA_EXES[name] then
+		title = minecraft_name(pid)
+	end
+	if title == nil and not is_store_helper(name) then
+		title = steam_game(path) or epic_game(path)
+	end
+	local custom = cfg.custom_games[name]
+	if custom ~= nil then
+		title = custom.name or title or name
+		capture = custom.capture or capture
+	end
+	return title, capture
 end
 
 -- OBS window strings are "title:class:exe" with '#' and ':' escaped.
@@ -424,27 +859,22 @@ local function on_focus(hwnd, key)
 		return
 	end
 
-	local exe = process_exe(pid)
-	if exe == nil then
+	local path = process_path(pid)
+	if path == nil then
 		set_mode("screen", "(unknown process)")
 		return
 	end
 
+	local exe = path:match("[^\\]+$")
 	local name = normalize_exe(exe)
 	if cfg.held[name] or (name == "explorer" and EXPLORER_HOLD_CLASSES[class]) then
 		return
 	end
-	local title, capture = db_entry(name)
-	local custom = cfg.custom_games[name]
-	local game = title
-	if custom ~= nil then
-		game = custom.name or title or name
-		capture = custom.capture or capture
+	local game, capture = nil, nil
+	if not cfg.excluded[name] then
+		game, capture = identify(pid, path, name)
 	end
-	local kind = "screen"
-	if game ~= nil and not cfg.excluded[name] then
-		kind = capture or "game"
-	end
+	local kind = game ~= nil and (capture or "game") or "screen"
 
 	local label = string.format("%s (%s)", game or name, exe)
 	if kind == "screen" then
@@ -586,13 +1016,6 @@ local function unique_path(path)
 		n = n + 1
 	end
 	return candidate
-end
-
-local function utf8_to_wide(s)
-	local n = kernel32.MultiByteToWideChar(CP_UTF8, 0, s, -1, nil, 0)
-	local buf = ffi.new("uint16_t[?]", math.max(n, 1))
-	kernel32.MultiByteToWideChar(CP_UTF8, 0, s, -1, buf, n)
-	return buf
 end
 
 -- Hard links a saved replay into the configured folder (e.g. a folder another
@@ -770,14 +1193,12 @@ local function poll_db_download()
 	end
 	obs.timer_remove(poll_db_download)
 	db_download = nil
-	local code = ffi.new("uint32_t[1]")
-	local ok = kernel32.GetExitCodeProcess(download.process, code) ~= 0 and code[0] == 0
-	kernel32.CloseHandle(download.process)
-	if ok then
+	local code = finish_process(download.process)
+	if code == 0 then
 		install_db(download)
 	else
 		obs.script_log(obs.LOG_WARNING, string.format(
-			"Could not download game database from %s (curl exit code %d)", download.url, tonumber(code[0])))
+			"Could not download game database from %s (curl exit code %d)", download.url, code))
 		obs.os_unlink(download.tmp)
 	end
 end
@@ -791,19 +1212,13 @@ local function check_db_update()
 	local path = default_db_path()
 	local tmp = path .. ".download"
 	obs.os_unlink(tmp)
-	local curl = (os.getenv("SystemRoot") or "C:\\Windows") .. "\\System32\\curl.exe"
-	local url = cfg.db_url:gsub('"', "")
-	local cmd = string.format('"%s" -fsSL --max-time 60 -o "%s" "%s"', curl, (tmp:gsub("/", "\\")), url)
-	local startup = ffi.new("STARTUPINFOW")
-	startup.cb = ffi.sizeof(startup)
-	local info = ffi.new("PROCESS_INFORMATION")
-	if kernel32.CreateProcessW(nil, utf8_to_wide(cmd), nil, nil, 0, CREATE_NO_WINDOW, nil, nil, startup, info) == 0 then
-		warn_once("curl", string.format("Could not start %s to update the game database (error %d)",
-			curl, tonumber(kernel32.GetLastError())))
+	local url = cfg.db_url
+	local process, err = start_curl(url, tmp)
+	if process == nil then
+		warn_once("curl", string.format("Could not start %s to update the game database (error %d)", CURL_PATH, err))
 		return
 	end
-	kernel32.CloseHandle(info.hThread)
-	db_download = { process = info.hProcess, tmp = tmp, path = path, url = url }
+	db_download = { process = process, tmp = tmp, path = path, url = url }
 	obs.timer_add(poll_db_download, DB_DOWNLOAD_POLL_MS)
 end
 
@@ -870,25 +1285,30 @@ function script_properties()
 	return props
 end
 
+local function set_default_list(settings, name, values)
+	local array = obs.obs_data_array_create()
+	for _, value in ipairs(values) do
+		local item = obs.obs_data_create()
+		obs.obs_data_set_string(item, "value", value)
+		obs.obs_data_array_push_back(array, item)
+		obs.obs_data_release(item)
+	end
+	obs.obs_data_set_default_array(settings, name, array)
+	obs.obs_data_array_release(array)
+end
+
 function script_defaults(settings)
 	obs.obs_data_set_default_bool(settings, "enabled", true)
 	obs.obs_data_set_default_bool(settings, "db_auto_update", true)
 	obs.obs_data_set_default_string(settings, "db_url", DEFAULT_DB_URL)
 	obs.obs_data_set_default_bool(settings, "sort_replays", true)
-	obs.obs_data_set_default_int(settings, "interval", 250)
-	local held = obs.obs_data_array_create()
-	for _, exe in ipairs(DEFAULT_HELD_EXES) do
-		local item = obs.obs_data_create()
-		obs.obs_data_set_string(item, "value", exe)
-		obs.obs_data_array_push_back(held, item)
-		obs.obs_data_release(item)
-	end
-	obs.obs_data_set_default_array(settings, "held_exes", held)
-	obs.obs_data_array_release(held)
+	obs.obs_data_set_default_int(settings, "interval", 200)
+	set_default_list(settings, "held_exes", DEFAULT_HELD_EXES)
 end
 
 function script_load(settings)
 	obs.obs_frontend_add_event_callback(on_frontend_event)
+	steam_types = obs.obs_data_create_from_json_file_safe(steam_types_path(), ".bak") or obs.obs_data_create()
 end
 
 function script_update(settings)
@@ -943,9 +1363,18 @@ function script_unload()
 	obs.timer_remove(retry_moves)
 	obs.timer_remove(check_db_update)
 	obs.timer_remove(poll_db_download)
+	obs.timer_remove(poll_steam_query)
 	if db_download ~= nil then
 		kernel32.CloseHandle(db_download.process)
 		db_download = nil
+	end
+	if steam_query ~= nil then
+		kernel32.CloseHandle(steam_query.process)
+		steam_query = nil
+	end
+	if steam_types ~= nil then
+		obs.obs_data_release(steam_types)
+		steam_types = nil
 	end
 	obs.obs_frontend_remove_event_callback(on_frontend_event)
 	if db ~= nil then
