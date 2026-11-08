@@ -13,7 +13,7 @@ An OBS script that detects the game you're playing and sorts Replay Buffer clips
 - Matches games by executable name against a database of about 11,000 games, plus your own custom entries.
 - Also detects Steam and Epic Games Store games from where they're installed, and Minecraft, with Prism Launcher and MultiMC instances named separately (e.g. `Minecraft (Fabulously Optimized)`).
 - Moves saved replays into a folder named after the game, keeping your filename formatting.
-- Optionally hard links every saved replay into a second folder, e.g. Medal.
+- Optionally hard links every saved replay into a second folder, e.g. for use with Medal.
 - Downloads and keeps the game database up to date automatically.
 
 ## Installation
