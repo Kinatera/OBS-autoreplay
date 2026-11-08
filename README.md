@@ -1,6 +1,6 @@
 # AutoReplay
 
-![version](https://img.shields.io/badge/version-0.1.0-1abc9c)
+![version](https://img.shields.io/badge/version-0.2.0-1abc9c)
 [![license](https://img.shields.io/badge/license-GPL%20v3%20or%20later-0078d7)](LICENSE)
 ![platform](https://img.shields.io/badge/platform-Windows-0078d7)
 ![OBS](https://img.shields.io/badge/OBS-28.x%2B-3a3a3a)
@@ -22,6 +22,8 @@ An OBS script that detects the game you're playing and sorts Replay Buffer clips
 2. In OBS, open **Tools → Scripts**, click **+** and pick `auto-replay.lua`.
 
 `games_database.json` is optional: if it's missing, the script downloads it.
+
+On load, the script checks GitHub for a newer version and opens the script log with a notice if there is one. It doesn't update itself; download the new version manually.
 
 ## Recommended Setup
 

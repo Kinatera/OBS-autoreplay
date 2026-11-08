@@ -84,6 +84,9 @@ local user32 = ffi.load("user32")
 local kernel32 = ffi.load("kernel32")
 local ntdll = ffi.load("ntdll")
 
+-- Bump on every release: copies older than the one on GitHub show a notice.
+local SCRIPT_VERSION = "0.2.0"
+
 local CP_UTF8 = 65001
 local PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 local WINDOW_PRIORITY_TITLE = 1
@@ -104,6 +107,9 @@ local DB_MAX_FOLDER_DEPTH = 5
 local DB_UPDATE_HOURS = 6
 local DB_DOWNLOAD_POLL_MS = 500
 local DEFAULT_DB_URL = "https://raw.githubusercontent.com/Kinatera/OBS-autoreplay/main/games_database.json"
+local REPO_URL = "https://github.com/Kinatera/OBS-autoreplay"
+local LATEST_SCRIPT_URL = "https://raw.githubusercontent.com/Kinatera/OBS-autoreplay/main/auto-replay.lua"
+local UPDATE_CHECK_POLL_MS = 500
 local CURL_PATH = (os.getenv("SystemRoot") or "C:\\Windows") .. "\\System32\\curl.exe"
 local STEAM_STORE_QUERY_URL = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json="
 local STEAM_TYPES_NAME = "steam_app_types.json" -- cached Steam store app types, next to the script
@@ -1230,6 +1236,62 @@ local function check_db_update()
 	obs.timer_add(poll_db_download, DB_DOWNLOAD_POLL_MS)
 end
 
+-- Script update check --------------------------------------------------------------
+
+local update_check = nil -- running curl download of the latest script: { process, tmp }
+
+-- True when version a (e.g. "0.10.2") is newer than version b.
+local function version_newer(a, b)
+	local pa, pb = {}, {}
+	for n in a:gmatch("%d+") do
+		pa[#pa + 1] = tonumber(n)
+	end
+	for n in b:gmatch("%d+") do
+		pb[#pb + 1] = tonumber(n)
+	end
+	for i = 1, math.max(#pa, #pb) do
+		local x, y = pa[i] or 0, pb[i] or 0
+		if x ~= y then
+			return x > y
+		end
+	end
+	return false
+end
+
+local function poll_update_check()
+	local check = update_check
+	if check == nil then
+		obs.timer_remove(poll_update_check)
+		return
+	end
+	if kernel32.WaitForSingleObject(check.process, 0) ~= 0 then
+		return -- still running
+	end
+	obs.timer_remove(poll_update_check)
+	update_check = nil
+	local text = finish_process(check.process) == 0 and read_file(check.tmp) or nil
+	obs.os_unlink(check.tmp)
+	local latest = text and text:match('local SCRIPT_VERSION = "([%d%.]+)"')
+	if latest ~= nil and version_newer(latest, SCRIPT_VERSION) then
+		-- Logged as a warning so OBS opens the script log.
+		obs.script_log(obs.LOG_WARNING, string.format(
+			"AutoReplay %s is available (you have %s). Download it from %s", latest, SCRIPT_VERSION, REPO_URL))
+	end
+end
+
+-- Looks for a newer version of this script on GitHub in the background. Only
+-- tells the user; never replaces the script. Fails quietly when offline.
+local function check_script_update()
+	local tmp = (os.getenv("TEMP") or script_path()) .. "\\autoreplay-latest.lua"
+	obs.os_unlink(tmp)
+	local process = start_curl(LATEST_SCRIPT_URL, tmp)
+	if process == nil then
+		return
+	end
+	update_check = { process = process, tmp = tmp }
+	obs.timer_add(poll_update_check, UPDATE_CHECK_POLL_MS)
+end
+
 -- OBS script interface ------------------------------------------------------------
 
 function script_description()
@@ -1322,6 +1384,7 @@ function script_load(settings)
 	local scene = obs.obs_frontend_get_current_scene()
 	collection_loaded = scene ~= nil
 	obs.obs_source_release(scene)
+	check_script_update()
 end
 
 function script_update(settings)
@@ -1377,6 +1440,11 @@ function script_unload()
 	obs.timer_remove(check_db_update)
 	obs.timer_remove(poll_db_download)
 	obs.timer_remove(poll_steam_query)
+	obs.timer_remove(poll_update_check)
+	if update_check ~= nil then
+		kernel32.CloseHandle(update_check.process)
+		update_check = nil
+	end
 	if db_download ~= nil then
 		kernel32.CloseHandle(db_download.process)
 		db_download = nil
