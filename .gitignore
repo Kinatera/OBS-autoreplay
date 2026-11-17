@@ -1,0 +1,5 @@
+# Written by the script at runtime, next to it
+steam_app_types.json
+*.download
+*.bak
+*.tmp
